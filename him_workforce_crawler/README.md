@@ -120,7 +120,7 @@ him_workforce_crawler/
 ```bash
 cd him_workforce_crawler
 
-py -3.11 -m venv .venv
+python -m venv .venv
 
 .venv\Scripts\activate
 
