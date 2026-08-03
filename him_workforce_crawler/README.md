@@ -119,10 +119,14 @@ him_workforce_crawler/
 
 ```bash
 cd him_workforce_crawler
-python3.11 -m venv .venv
-source .venv/bin/activate
+
+py -3.11 -m venv .venv
+
+.venv\Scripts\activate
+
 pip install -r requirements.txt
-cp .env.example .env   # optional keyword overrides
+
+copy .env.example .env   # optional keyword overrides
 ```
 
 Python 3.11+ required.
