@@ -10,34 +10,30 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urljoin
 
-import requests
 from bs4 import BeautifulSoup
 
 from crawlers.base_crawler import BaseCrawler
+from crawlers.fetch_backends import (
+    BaseFetcher,
+    IndeedAccessBlocked,
+    OfflineHtmlFetcher,
+    build_fetcher,
+    detect_access_block,
+)
 from models.job_record import RawJobPosting, today_iso
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Connection": "keep-alive",
-}
 
 
 class IndeedCrawler(BaseCrawler):
     """Crawl Indeed search results and job detail pages.
 
     Notes for researchers:
-    - Indeed frequently challenges automated clients. When a live request is
-      blocked or returns no parseable jobs, the crawler can fall back to a
-      transparent demo dataset (``use_demo_fallback=True``) so the downstream
-      filtering/normalization pipeline remains testable and reproducible.
+    - Indeed frequently challenges automated clients (403 / Permission Denied /
+      CAPTCHA). Prefer ``fetch_mode="playwright"`` or ``fetch_mode="offline"``.
+    - When a live request is blocked or returns no parseable jobs, the crawler
+      can fall back to a transparent demo dataset (``use_demo_fallback=True``).
     - Every raw HTML/JSON payload is written under ``data/raw/``.
     """
 
@@ -48,19 +44,30 @@ class IndeedCrawler(BaseCrawler):
         self,
         raw_output_dir: Path | str,
         *,
-        request_delay_seconds: float = 2.0,
+        request_delay_seconds: float = 3.0,
         max_pages: int = 1,
-        timeout_seconds: int = 30,
+        timeout_seconds: int = 45,
         use_demo_fallback: bool = True,
-        session: requests.Session | None = None,
+        fetch_mode: str = "requests",
+        html_dir: Path | str | None = None,
+        browser_headed: bool = False,
+        fetcher: BaseFetcher | None = None,
     ) -> None:
         super().__init__(raw_output_dir)
         self.request_delay_seconds = request_delay_seconds
         self.max_pages = max_pages
         self.timeout_seconds = timeout_seconds
         self.use_demo_fallback = use_demo_fallback
-        self.session = session or requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
+        self.fetch_mode = fetch_mode
+        self.html_dir = Path(html_dir) if html_dir else None
+        self.browser_headed = browser_headed
+        self.fetcher = fetcher or build_fetcher(
+            fetch_mode,
+            html_dir=html_dir,
+            headless=not browser_headed,
+            timeout_seconds=timeout_seconds,
+        )
+        self._blocked_count = 0
 
     def build_search_url(self, keyword: str, location: str, start: int = 0) -> str:
         """Build an Indeed search URL for keyword/location pagination."""
@@ -69,24 +76,26 @@ class IndeedCrawler(BaseCrawler):
         return f"{self.base_url}/jobs?q={query}&l={loc}&start={start}"
 
     def fetch_page(self, url: str, **kwargs: Any) -> str:
-        """HTTP GET a page with retry-friendly error handling."""
-        logger.info("Fetching Indeed page: %s", url)
-        try:
-            response = self.session.get(url, timeout=self.timeout_seconds)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as exc:
-            logger.error("Failed to fetch %s: %s", url, exc)
-            raise
+        """Fetch a page through the configured backend."""
+        html = self.fetcher.fetch(url)
+        reason = detect_access_block(html)
+        if reason:
+            self._blocked_count += 1
+            raise IndeedAccessBlocked(reason)
+        return html
 
     def parse_jobs(self, page_content: str, **kwargs: Any) -> list[dict[str, Any]]:
         """Parse Indeed search HTML into job summary dictionaries."""
+        reason = detect_access_block(page_content)
+        if reason:
+            logger.warning("Refusing to parse blocked page: %s", reason)
+            return []
+
         soup = BeautifulSoup(page_content, "lxml")
         jobs: list[dict[str, Any]] = []
 
         cards = soup.select("div.job_seen_beacon, div.resultContent, li.css-5lfssg")
         if not cards:
-            # Fallback selectors for alternate Indeed layouts.
             cards = soup.select("a[data-jk], div[data-jk]")
 
         seen_keys: set[str] = set()
@@ -160,9 +169,8 @@ class IndeedCrawler(BaseCrawler):
         """Enrich a job summary with detail-page description when available."""
         description = job_ref.get("description", "")
         url = job_ref.get("url", "")
-        detail_html = ""
 
-        if url:
+        if url and self.fetch_mode != "offline":
             try:
                 time.sleep(self.request_delay_seconds)
                 detail_html = self.fetch_page(url)
@@ -198,6 +206,67 @@ class IndeedCrawler(BaseCrawler):
         )
         return node.get_text("\n", strip=True) if node else ""
 
+    def crawl_from_html_dir(
+        self,
+        html_dir: Path | str,
+        *,
+        search_keyword: str = "",
+        search_location: str = "",
+    ) -> list[RawJobPosting]:
+        """Parse locally saved Indeed HTML pages (anti-bot-safe research path)."""
+        offline = OfflineHtmlFetcher(html_dir)
+        results: list[RawJobPosting] = []
+        files = offline.list_html_files()
+        if not files:
+            logger.warning("No .html/.htm files found in %s", html_dir)
+            return results
+
+        for path in files:
+            logger.info("Parsing offline HTML: %s", path.name)
+            html = path.read_text(encoding="utf-8", errors="ignore")
+            # Archive a copy into data/raw for reproducibility.
+            self.save_raw_payload(f"offline_ingest_{path.name}", html)
+            meta_keyword, meta_location = self._infer_search_meta_from_filename(
+                path.name,
+                default_keyword=search_keyword,
+                default_location=search_location,
+            )
+            for card in self.parse_jobs(html):
+                results.append(
+                    RawJobPosting(
+                        job_title=card.get("job_title", ""),
+                        company=card.get("company", ""),
+                        location=card.get("location", "") or meta_location,
+                        salary=card.get("salary", ""),
+                        description=card.get("description", ""),
+                        url=card.get("url", ""),
+                        posting_date=card.get("posting_date", ""),
+                        source_platform=self.source_platform,
+                        search_keyword=meta_keyword,
+                        search_location=meta_location,
+                        collected_at=today_iso(),
+                    )
+                )
+        logger.info("Offline ingest complete: %d raw jobs from %d files", len(results), len(files))
+        return results
+
+    @staticmethod
+    def _infer_search_meta_from_filename(
+        filename: str,
+        *,
+        default_keyword: str,
+        default_location: str,
+    ) -> tuple[str, str]:
+        """Best-effort keyword/location inference from offline filenames."""
+        stem = Path(filename).stem
+        # Accept patterns like: louisiana__health_information_management.html
+        if "__" in stem:
+            left, right = stem.split("__", 1)
+            location = left.replace("_", " ").strip() or default_location
+            keyword = right.replace("_", " ").strip() or default_keyword
+            return keyword, location
+        return default_keyword, default_location
+
     def crawl(
         self,
         keywords: list[str],
@@ -208,13 +277,72 @@ class IndeedCrawler(BaseCrawler):
         max_pages = int(kwargs.get("max_pages", self.max_pages))
         fetch_details = bool(kwargs.get("fetch_details", False))
         force_demo = bool(kwargs.get("force_demo", False))
+        html_dir = kwargs.get("html_dir", self.html_dir)
 
         results: list[RawJobPosting] = []
         live_success = False
+        self._blocked_count = 0
 
-        if force_demo:
-            logger.warning("force_demo=True: using transparent demo Indeed dataset")
-            return self._demo_jobs(keywords, locations)
+        try:
+            if force_demo:
+                logger.warning("force_demo=True: using transparent demo Indeed dataset")
+                return self._demo_jobs(keywords, locations)
+
+            if self.fetch_mode == "offline":
+                if html_dir is None:
+                    raise ValueError("html_dir is required for offline fetch mode")
+                results = self.crawl_from_html_dir(
+                    html_dir,
+                    search_keyword=keywords[0] if keywords else "",
+                    search_location=locations[0] if locations else "",
+                )
+                live_success = bool(results)
+            else:
+                results, live_success = self._crawl_live(
+                    keywords=keywords,
+                    locations=locations,
+                    max_pages=max_pages,
+                    fetch_details=fetch_details,
+                )
+
+            if not results and self.use_demo_fallback and not live_success:
+                if self._blocked_count:
+                    logger.warning(
+                        "Indeed blocked automated access (%d challenge/block events). "
+                        "Recommended next steps:\n"
+                        "  1) python main.py --fetch-mode playwright --browser-headed\n"
+                        "  2) python main.py --fetch-mode offline --html-dir data/raw/manual_indeed\n"
+                        "Falling back to transparent demo dataset for pipeline continuity.",
+                        self._blocked_count,
+                    )
+                else:
+                    logger.warning(
+                        "Live Indeed crawl returned no jobs. "
+                        "Falling back to transparent demo dataset for pipeline continuity."
+                    )
+                results = self._demo_jobs(keywords, locations)
+
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            payload = [job.model_dump() for job in results]
+            self.save_raw_payload(
+                f"indeed_raw_jobs_{stamp}.json",
+                json.dumps(payload, indent=2, ensure_ascii=False),
+            )
+            logger.info("Indeed crawl complete: %d raw jobs", len(results))
+            return results
+        finally:
+            self.fetcher.close()
+
+    def _crawl_live(
+        self,
+        *,
+        keywords: list[str],
+        locations: list[str],
+        max_pages: int,
+        fetch_details: bool,
+    ) -> tuple[list[RawJobPosting], bool]:
+        results: list[RawJobPosting] = []
+        live_success = False
 
         for keyword in keywords:
             for location in locations:
@@ -264,6 +392,14 @@ class IndeedCrawler(BaseCrawler):
                                     collected_at=today_iso(),
                                 )
                             results.append(posting)
+                    except IndeedAccessBlocked as exc:
+                        self._blocked_count += 1
+                        logger.error(
+                            "Indeed access blocked keyword=%s location=%s: %s",
+                            keyword,
+                            location,
+                            exc,
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.error(
                             "Crawl error keyword=%s location=%s: %s",
@@ -272,29 +408,10 @@ class IndeedCrawler(BaseCrawler):
                             exc,
                         )
 
-        if not results and self.use_demo_fallback and not live_success:
-            logger.warning(
-                "Live Indeed crawl returned no jobs (blocked or empty). "
-                "Falling back to transparent demo dataset for pipeline continuity."
-            )
-            results = self._demo_jobs(keywords, locations)
-
-        # Persist consolidated raw JSON for reproducibility.
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        payload = [job.model_dump() for job in results]
-        self.save_raw_payload(
-            f"indeed_raw_jobs_{stamp}.json",
-            json.dumps(payload, indent=2, ensure_ascii=False),
-        )
-        logger.info("Indeed crawl complete: %d raw jobs", len(results))
-        return results
+        return results, live_success
 
     def _demo_jobs(self, keywords: list[str], locations: list[str]) -> list[RawJobPosting]:
-        """Return labeled synthetic/demo jobs for offline reproducibility.
-
-        Each record notes that it is a demo fallback so research outputs remain
-        transparent about provenance.
-        """
+        """Return labeled synthetic/demo jobs for offline reproducibility."""
         keyword = keywords[0] if keywords else "Health Information Management"
         samples = [
             {
@@ -387,7 +504,6 @@ class IndeedCrawler(BaseCrawler):
         demo_jobs: list[RawJobPosting] = []
         for index, sample in enumerate(samples, start=1):
             loc = sample["location"]
-            # Prefer an inclusion location when available for search provenance.
             search_location = locations[0] if locations else loc
             demo_jobs.append(
                 RawJobPosting(

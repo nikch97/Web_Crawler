@@ -147,13 +147,52 @@ This uses a clearly labeled demo/fallback Indeed dataset, then applies the real 
 - `data/processed/EXCLUSION_RULES.json`
 - `data/processed/OUTPUT_SCHEMA.json`
 
-### Live Indeed crawl
+### Live Indeed crawl (often blocked)
 
 ```bash
 python main.py --max-pages 1
 ```
 
-If the live crawl is blocked/empty, the crawler falls back to the demo dataset unless `--no-demo-fallback` is set.
+Indeed commonly returns **Permission Denied / 403 / CAPTCHA** to plain HTTP clients (`requests`). That is expected anti-bot behavior, not a bug in this pipeline.
+
+### Handling Indeed anti-bot protections
+
+Use one of these research-safe modes (in recommended order):
+
+#### 1) Offline HTML ingest (most reliable for academic work)
+
+1. Open Indeed in your normal browser and run your search.
+2. Save the results page as HTML into `data/raw/manual_indeed/`.
+3. Run:
+
+```bash
+python main.py --fetch-mode offline --html-dir data/raw/manual_indeed
+```
+
+See `data/raw/manual_indeed/README.md`.
+
+#### 2) Playwright browser fetch
+
+```bash
+pip install playwright
+playwright install chromium
+
+# Headless attempt
+python main.py --fetch-mode playwright --max-pages 1 --request-delay 5
+
+# If challenged, use a visible browser window
+python main.py --fetch-mode playwright --browser-headed --max-pages 1
+```
+
+#### 3) Demo fallback (pipeline testing only)
+
+```bash
+python main.py --demo
+```
+
+If a live crawl is blocked/empty, the crawler falls back to the labeled demo dataset unless `--no-demo-fallback` is set.
+
+**Out of scope on purpose:** CAPTCHA-solving services, residential-proxy rotation, and fingerprint spoofing. Those are fragile, often violate site terms, and reduce research transparency. Prefer offline ingest or official/partner data sources when automation is blocked.
 
 ### Useful options
 
@@ -161,6 +200,8 @@ If the live crawl is blocked/empty, the crawler falls back to the demo dataset u
 python main.py --keywords "Health Information Management" "RHIA" --locations Louisiana Remote
 python main.py --fetch-details
 python main.py --demo
+python main.py --fetch-mode offline --html-dir data/raw/manual_indeed
+python main.py --fetch-mode playwright --browser-headed
 ```
 
 Search keywords are **query parameters for Indeed**, not hardcoded inclusion criteria. Inclusion/exclusion business rules always come from the input spreadsheets.
