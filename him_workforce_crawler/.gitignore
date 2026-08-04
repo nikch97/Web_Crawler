@@ -8,9 +8,15 @@ venv/
 .mypy_cache/
 data/raw/*
 !data/raw/.gitkeep
+!data/raw/manual_indeed/
+data/raw/manual_indeed/*
+!data/raw/manual_indeed/README.md
+!data/raw/manual_indeed/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
 data/final/*
 !data/final/.gitkeep
+# Keep tiny fixtures used by unit tests
+!tests/fixtures/
 *.log
 .DS_Store
