@@ -105,6 +105,32 @@ def parse_args() -> argparse.Namespace:
         help="Do not fall back to demo data if live crawl is empty/blocked",
     )
     parser.add_argument(
+        "--fetch-mode",
+        choices=["requests", "playwright", "offline"],
+        default="requests",
+        help=(
+            "How to obtain Indeed HTML: requests (often blocked), "
+            "playwright (real browser), offline (parse saved HTML)"
+        ),
+    )
+    parser.add_argument(
+        "--html-dir",
+        type=Path,
+        default=ROOT / "data" / "raw" / "manual_indeed",
+        help="Directory of manually saved Indeed HTML pages (offline mode)",
+    )
+    parser.add_argument(
+        "--browser-headed",
+        action="store_true",
+        help="Run Playwright with a visible browser window (useful for challenges)",
+    )
+    parser.add_argument(
+        "--request-delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between Indeed requests (be polite; default 3)",
+    )
+    parser.add_argument(
         "--log-file",
         type=Path,
         default=ROOT / "data" / "processed" / "pipeline.log",
@@ -153,10 +179,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
     logger.info("Search keywords: %s", search_keywords)
     logger.info("Search locations: %s", search_locations)
 
+    logger.info("Fetch mode: %s", args.fetch_mode)
     crawler = IndeedCrawler(
         raw_output_dir=args.raw_dir,
         max_pages=args.max_pages,
         use_demo_fallback=not args.no_demo_fallback,
+        fetch_mode=args.fetch_mode,
+        html_dir=args.html_dir,
+        browser_headed=args.browser_headed,
+        request_delay_seconds=args.request_delay,
     )
     raw_jobs = crawler.crawl(
         keywords=search_keywords,
@@ -164,6 +195,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         max_pages=args.max_pages,
         fetch_details=args.fetch_details,
         force_demo=args.demo,
+        html_dir=args.html_dir,
     )
     raw_jobs = deduplicate_raw_jobs(raw_jobs)
     write_json(
